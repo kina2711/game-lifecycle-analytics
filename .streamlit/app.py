@@ -1,112 +1,167 @@
 import streamlit as st
 import pandas as pd
+from google.cloud import bigquery
+from google.oauth2 import service_account
 import plotly.express as px
-import scipy.stats as stats
-import os
+from scipy import stats
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(page_title="Game Lifecycle Analytics", page_icon="🎮", layout="wide")
 
-# --- 2. DATA LOADER ---
-@st.cache_data
-def load_raw_data():
-    base_path = "../data/raw/"
+# Lấy thông tin Project ID từ secrets
+try:
+    PROJECT_ID = st.secrets["gcp_service_account"]["project_id"]
+    DATASET_ID = "game_lifecycle_analytics"
+except:
+    st.error("Chưa cấu hình secrets.toml hoặc thiếu Project ID.")
+    st.stop()
 
-    # Đọc CSV với dấu chấm phẩy (;)
-    try:
-        df_reg = pd.read_csv(os.path.join(base_path, "reg_data.csv"), sep=';')
-        df_auth = pd.read_csv(os.path.join(base_path, "auth_data.csv"), sep=';')
-        df_ab = pd.read_csv(os.path.join(base_path, "ab_test.csv"), sep=';')
-    except Exception as e:
-        st.error(f"❌ Lỗi đọc file: {e}")
-        st.stop()
+# --- 2. BIGQUERY CONNECTION ---
+@st.cache_resource
+def get_bq_client():
+    creds = service_account.Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"]
+    )
+    return bigquery.Client(credentials=creds, project=creds.project_id)
 
-    # --- XỬ LÝ QUAN TRỌNG: TIME CONVERSION ---
-    # Ép kiểu về numeric để tránh lỗi string, sau đó convert từ Unix Seconds -> Datetime
-    df_reg['reg_ts'] = pd.to_numeric(df_reg['reg_ts'], errors='coerce')
-    df_auth['auth_ts'] = pd.to_numeric(df_auth['auth_ts'], errors='coerce')
-
-    df_reg['reg_date'] = pd.to_datetime(df_reg['reg_ts'], unit='s').dt.date
-    df_auth['auth_date'] = pd.to_datetime(df_auth['auth_ts'], unit='s').dt.date
-
-    # Merge bảng Master
-    df_master = pd.merge(df_reg, df_ab, on='uid', how='left')
-    df_master['revenue'] = df_master['revenue'].fillna(0)
-    df_master['testgroup'] = df_master['testgroup'].fillna('unknown')
-
-    return df_reg, df_auth, df_master
-
-# Load Data
-df_reg, df_auth, df_master = load_raw_data()
+@st.cache_data(ttl=3600)
+def run_query(query):
+    client = get_bq_client()
+    return client.query(query).to_dataframe()
 
 # --- 3. SIDEBAR ---
 st.sidebar.title("🎮 Game Analytics")
-st.sidebar.info("**Author:** Rabbit (Thai Trung Kien)\n\n**Data Source:** Kaggle Game Analytics")
+st.sidebar.caption(f"Source: `{PROJECT_ID}.{DATASET_ID}`")
+st.sidebar.info("**Analyst:** Rabbit (Thai Trung Kien)\n\n**Tech:** BigQuery + Streamlit")
 
-# --- 4. DASHBOARD TABS ---
+# --- 4. DATA PROCESSING (SQL LOGIC) ---
 tab1, tab2, tab3 = st.tabs(["📈 Overview", "🔄 Retention", "💰 Monetization"])
 
+# === TAB 1: OVERVIEW ===
 with tab1:
     st.header("Game Health Overview")
+
+    # Query tổng hợp:
+    sql_overview = f"""
+        SELECT 
+            COUNT(DISTINCT t1.uid) as total_users,
+            SUM(t2.revenue) as total_revenue,
+            COUNT(DISTINCT CASE WHEN t2.revenue > 0 THEN t1.uid END) as paying_users
+        FROM `{PROJECT_ID}.{DATASET_ID}.reg_data` t1
+        LEFT JOIN `{PROJECT_ID}.{DATASET_ID}.ab_test` t2 ON t1.uid = t2.user_id
+    """
+    df_overview = run_query(sql_overview)
+
     col1, col2, col3 = st.columns(3)
-    col1.metric("Total Users", f"{df_master['uid'].nunique():,}")
-    col2.metric("Total Revenue", f"${df_master['revenue'].sum():,.0f}")
-    col3.metric("Paying User Rate", f"{(df_master[df_master['revenue'] > 0].shape[0] / df_master.shape[0]) * 100:.2f}%")
+    col1.metric("Total Users", f"{df_overview['total_users'][0]:,}")
+    col2.metric("Total Revenue", f"${df_overview['total_revenue'][0]:,.0f}")
+    if df_overview['total_users'][0] > 0:
+        rate = (df_overview['paying_users'][0] / df_overview['total_users'][0]) * 100
+        col3.metric("Paying Rate", f"{rate:.2f}%")
 
-    # Biểu đồ User mới theo ngày
-    daily_users = df_master.groupby('reg_date')['uid'].count().reset_index()
-    fig = px.line(daily_users, x='reg_date', y='uid', title="New Users Trend", markers=True)
-    st.plotly_chart(fig, use_container_width=True)
+    st.divider()
 
+    # Biểu đồ User mới
+    sql_trend = f"""
+        SELECT 
+            DATE(TIMESTAMP_SECONDS(reg_ts)) as reg_date,
+            COUNT(uid) as new_users
+        FROM `{PROJECT_ID}.{DATASET_ID}.reg_data`
+        GROUP BY 1 ORDER BY 1
+    """
+    df_trend = run_query(sql_trend)
+    fig_trend = px.line(df_trend, x='reg_date', y='new_users', markers=True,
+                        title="New Users Trend", template="plotly_dark")
+    st.plotly_chart(fig_trend, use_container_width=True)
+
+# === TAB 2: RETENTION ===
 with tab2:
     st.header("Cohort Retention Analysis")
 
-    # Logic tính Retention chuẩn Pandas
-    # Bước 1: Join Auth với Reg để lấy ngày đăng ký của từng lần đăng nhập
-    merged = pd.merge(df_auth, df_reg[['uid', 'reg_date']], on='uid', how='inner')
+    # Query Retention
+    sql_retention = f"""
+    WITH cohort AS (
+        SELECT uid, DATE(TIMESTAMP_SECONDS(reg_ts)) as cohort_date
+        FROM `{PROJECT_ID}.{DATASET_ID}.reg_data`
+    ),
+    activity AS (
+        SELECT uid, DATE(TIMESTAMP_SECONDS(auth_ts)) as activity_date
+        FROM `{PROJECT_ID}.{DATASET_ID}.auth_data`
+    )
+    SELECT 
+        c.cohort_date,
+        DATE_DIFF(a.activity_date, c.cohort_date, DAY) as day_diff,
+        COUNT(DISTINCT c.uid) as user_count
+    FROM cohort c
+    JOIN activity a ON c.uid = a.uid
+    WHERE a.activity_date >= c.cohort_date
+      AND DATE_DIFF(a.activity_date, c.cohort_date, DAY) IN (0, 1, 3, 7, 14, 30)
+    GROUP BY 1, 2 ORDER BY 1, 2
+    """
 
-    # Bước 2: Tính số ngày quay lại (Auth Date - Reg Date)
-    merged['day_diff'] = (pd.to_datetime(merged['auth_date']) - pd.to_datetime(merged['reg_date'])).dt.days
+    try:
+        df_ret = run_query(sql_retention)
+        if not df_ret.empty:
+            cohort_pivot = df_ret.pivot(index='cohort_date', columns='day_diff', values='user_count')
+            retention_matrix = cohort_pivot.divide(cohort_pivot[0], axis=0)
 
-    # Bước 3: Chỉ lấy các mốc quan trọng (Day 0, 1, 3, 7, 14, 30)
-    cohort_days = [0, 1, 3, 7, 14, 30]
-    retention_data = merged[merged['day_diff'].isin(cohort_days)]
+            fig_heat = px.imshow(
+                retention_matrix, text_auto='.1%', color_continuous_scale='RdBu',
+                labels=dict(x="Days Since Reg", y="Cohort Date", color="Retention"), aspect="auto"
+            )
+            fig_heat.update_layout(height=600)
+            st.plotly_chart(fig_heat, use_container_width=True)
+    except Exception as e:
+        st.error(f"Lỗi SQL Retention: {e}")
 
-    # Bước 4: Đếm số user unique theo từng cohort và day_diff
-    cohort_counts = retention_data.groupby(['reg_date', 'day_diff'])['uid'].nunique().reset_index()
-
-    # Bước 5: Pivot bảng
-    cohort_pivot = cohort_counts.pivot(index='reg_date', columns='day_diff', values='uid')
-
-    # Bước 6: Tính % Retention (Chia cho cột Day 0)
-    cohort_size = cohort_pivot[0]
-    retention_matrix = cohort_pivot.divide(cohort_size, axis=0)
-
-    # Vẽ Heatmap
-    fig_heat = px.imshow(retention_matrix, text_auto='.1%', color_continuous_scale='RdBu', aspect="auto")
-    st.plotly_chart(fig_heat, use_container_width=True)
-
+# === TAB 3: MONETIZATION ===
 with tab3:
-    st.header("A/B Testing: Monetization")
+    st.header("A/B Testing & Monetization")
 
-    # Group theo nhóm A/B
-    ab_stats = df_master.groupby('testgroup').agg(
-        Users=('uid', 'count'),
-        Revenue=('revenue', 'sum'),
-        Paying_Users=('revenue', lambda x: (x > 0).sum())
-    ).reset_index()
+    # Query A/B Test:
+    sql_ab = f"""
+        SELECT 
+            testgroup,
+            COUNT(user_id) as users,
+            SUM(revenue) as total_rev,
+            COUNTIF(revenue > 0) as paying_users
+        FROM `{PROJECT_ID}.{DATASET_ID}.ab_test`
+        GROUP BY 1
+    """
+    df_ab = run_query(sql_ab)
 
-    ab_stats['ARPU'] = ab_stats['Revenue'] / ab_stats['Users']
-    st.dataframe(ab_stats.style.format({'Revenue': '${:,.2f}', 'ARPU': '${:.4f}'}))
+    df_ab['ARPU'] = df_ab['total_rev'] / df_ab['users']
+    df_ab['ARPPU'] = df_ab['total_rev'] / df_ab['paying_users']
+    df_ab['Conv_Rate'] = (df_ab['paying_users'] / df_ab['users']) * 100
 
-    # T-Test kiểm định thống kê
-    st.subheader("Statistical Test (T-Test)")
-    group_a = df_master[df_master['testgroup'] == 'a']['revenue']
-    group_b = df_master[df_master['testgroup'] == 'b']['revenue']
+    st.dataframe(df_ab.style.format({
+        'total_rev': '${:,.2f}', 'ARPU': '${:.4f}', 'ARPPU': '${:.2f}', 'Conv_Rate': '{:.2f}%'
+    }))
 
-    t_stat, p_val = stats.ttest_ind(group_a, group_b, equal_var=False)
-    st.write(f"**P-Value:** {p_val:.5f}")
-    if p_val < 0.05:
-        st.success("✅ Kết quả có ý nghĩa thống kê (Significant Difference).")
-    else:
-        st.warning("⚠️ Kết quả ngẫu nhiên, không có ý nghĩa thống kê.")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.plotly_chart(px.bar(df_ab, x='testgroup', y='ARPU', color='testgroup', title="ARPU", text_auto='.4f'),
+                        use_container_width=True)
+    with col2:
+        st.plotly_chart(px.bar(df_ab, x='testgroup', y='Conv_Rate', color='testgroup', title="Conversion Rate (%)",
+                               text_auto='.2f'), use_container_width=True)
+
+    st.divider()
+
+    # --- T-TEST ---
+    if st.button("Chạy kiểm định T-Test"):
+        with st.spinner("Đang tính toán..."):
+            # Lấy mẫu revenue theo group
+            sql_ttest = f"SELECT testgroup, revenue FROM `{PROJECT_ID}.{DATASET_ID}.ab_test`"
+            df_raw_test = run_query(sql_ttest)
+
+            group_a = df_raw_test[df_raw_test['testgroup'] == 'a']['revenue']
+            group_b = df_raw_test[df_raw_test['testgroup'] == 'b']['revenue']
+
+            t_stat, p_val = stats.ttest_ind(group_a, group_b, equal_var=False)
+
+            st.write(f"**P-Value:** {p_val:.5f}")
+            if p_val < 0.05:
+                st.success(f"✅ Kết quả có ý nghĩa thống kê.")
+            else:
+                st.warning("⚠️ Kết quả ngẫu nhiên.")
