@@ -5,3 +5,5 @@ db-dtypes
 plotly
 numpy
 scipy
+matplotlib
+seaborn
