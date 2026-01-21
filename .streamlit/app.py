@@ -76,43 +76,58 @@ with tab1:
 
 # === TAB 2: RETENTION ===
 with tab2:
-    st.header("Cohort Retention Analysis")
+    st.header("Daily Retention Curve")
+    st.markdown("Tỷ lệ người dùng quay lại theo số ngày sau khi đăng ký (Chu kỳ 10 ngày).")
 
-    # Query Retention
+    # Query lấy toàn bộ dữ liệu retention theo ngày
     sql_retention = f"""
-    WITH cohort AS (
-        SELECT uid, DATE(TIMESTAMP_SECONDS(reg_ts)) as cohort_date
-        FROM `{PROJECT_ID}.{DATASET_ID}.reg_data`
-    ),
-    activity AS (
-        SELECT uid, DATE(TIMESTAMP_SECONDS(auth_ts)) as activity_date
-        FROM `{PROJECT_ID}.{DATASET_ID}.auth_data`
-    )
-    SELECT 
-        c.cohort_date,
-        DATE_DIFF(a.activity_date, c.cohort_date, DAY) as day_diff,
-        COUNT(DISTINCT c.uid) as user_count
-    FROM cohort c
-    JOIN activity a ON c.uid = a.uid
-    WHERE a.activity_date >= c.cohort_date
-      AND DATE_DIFF(a.activity_date, c.cohort_date, DAY) IN (0, 1, 3, 7, 14, 30)
-    GROUP BY 1, 2 ORDER BY 1, 2
+        SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.vw_daily_retention_curve`
+        ORDER BY days_since_reg
     """
-
+    
     try:
         df_ret = run_query(sql_retention)
+        
         if not df_ret.empty:
-            cohort_pivot = df_ret.pivot(index='cohort_date', columns='day_diff', values='user_count')
-            retention_matrix = cohort_pivot.divide(cohort_pivot[0], axis=0)
+            # 1. Lọc theo chu kỳ 10 ngày (0, 10, 20, 30...)
+            # Logic: Lấy dòng mà days_since_reg chia hết cho 10
+            df_filtered = df_ret[df_ret['days_since_reg'] % 10 == 0].reset_index(drop=True)
+            
+            # Chỉ lấy 38 mốc đầu tiên
+            df_display = df_filtered.head(38)
 
-            fig_heat = px.imshow(
-                retention_matrix, text_auto='.1%', color_continuous_scale='RdBu',
-                labels=dict(x="Days Since Reg", y="Cohort Date", color="Retention"), aspect="auto"
-            )
-            fig_heat.update_layout(height=600)
-            st.plotly_chart(fig_heat, use_container_width=True)
+            # 2. Hiển thị Table
+            col_left, col_right = st.columns([1, 2])
+            
+            with col_left:
+                st.subheader("Data Table")
+                st.dataframe(
+                    df_display[['days_since_reg', 'retention_percent']].style.format({
+                        'retention_percent': '{:.4f}%'
+                    }),
+                    height=500
+                )
+            
+            # 3. Hiển thị Chart (Retention Curve)
+            with col_right:
+                st.subheader("Retention Chart")
+                # Vẽ biểu đồ đường
+                fig_line = px.line(
+                    df_display, 
+                    x='days_since_reg', 
+                    y='retention_percent',
+                    markers=True,
+                    title="Retention Rate (%) over Time",
+                    labels={'days_since_reg': 'Days Since Registration', 'retention_percent': 'Retention (%)'}
+                )
+                fig_line.update_traces(line_color='#1f77b4', marker=dict(size=8))
+                st.plotly_chart(fig_line, use_container_width=True)
+                
+        else:
+            st.warning("Chưa có dữ liệu Retention.")
+            
     except Exception as e:
-        st.error(f"Lỗi SQL Retention: {e}")
+        st.error(f"Lỗi truy vấn SQL: {e}")
 
 # === TAB 3: MONETIZATION ===
 with tab3:
